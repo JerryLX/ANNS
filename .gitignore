@@ -1,0 +1,27 @@
+# Datasets
+/data/
+
+# CMake and compiler output
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Benchmark output and crash dumps
+results*.csv
+core
+core.*
+
+# Python test caches
+__pycache__/
+*.py[cod]

@@ -19,6 +19,8 @@ Makefile
 
 # Benchmark output and crash dumps
 results*.csv
+*_results.csv
+*_summary.csv
 core
 core.*
 

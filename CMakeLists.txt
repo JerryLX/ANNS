@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(hnsw_threshold src/main.cpp)
+target_include_directories(hnsw_threshold SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party/hnswlib)
 target_compile_options(hnsw_threshold PRIVATE -Wall -Wextra -Wpedantic -O3)
 
 include(CTest)

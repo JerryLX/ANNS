@@ -10,7 +10,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-程序无第三方运行时依赖。C++ 代码使用 `.clang-format` 中的4空格规则。
+HNSW 后端使用仓库内固定版本的 [hnswlib](https://github.com/nmslib/hnswlib) v0.8.0（Apache-2.0，commit `3f342966`），它是 header-only 库，因此程序没有额外的动态链接运行时依赖。C++ 代码使用 `.clang-format` 中的4空格规则。
 
 ## 执行模型
 
@@ -71,7 +71,9 @@ external_tau_i = min(local_kth_j), j != i
 
 ## HNSW
 
-HNSW 使用共享 threshold 收紧第0层 frontier early-stop：
+HNSW 的建图、紧凑图内存布局、SIMD L2/IP 距离内核和索引序列化由官方 hnswlib 提供。实验适配层复用其 entry point、分层图和第0层邻接表，将底层搜索拆成逐次 frontier expansion，以便每次扩展前读取其他进程发布的 threshold，并统计真实的距离计算和图扩展数量。
+
+共享 threshold 收紧第0层 frontier early-stop：
 
 ```bash
 ./build/hnsw_threshold \
@@ -83,6 +85,8 @@ HNSW 使用共享 threshold 收紧第0层 frontier early-stop：
 ```
 
 HNSW frontier distance 不是未发现节点的严格下界。共享 threshold 可能提前截断通往近邻的桥接节点，因此必须同时检查 Recall。`--threshold-scale` 越大越保守；任何 Recall 明显下降的计算节省都不应视为有效收益。
+
+此前由项目自研简化 HNSW 产生的 `.hnsw` 文件与 hnswlib 格式不兼容，升级后必须使用 `--index-mode build` 重新构建一次。后续 `load` 使用 hnswlib 原生索引格式。
 
 建议至少满足：
 
@@ -149,6 +153,27 @@ SPANN: shard_0.spann, shard_1.spann, ...
 - `--index-mode load`：直接加载，不读取 base、不重新建索引。
 - `--index-mode build-if-missing`：文件齐全时加载，否则构建并保存。
 
+### BigANN 10M HNSW：完整操作流程
+
+先确认三个输入文件存在，并检查 GT 文件头。GT 中只有 ID 和距离，不包含 query；query 来自独立的 `query.public.10K.u8bin`：
+
+```bash
+ls -lh \
+    data/bigann/learn.100M.u8bin \
+    data/bigann/query.public.10K.u8bin \
+    data/bigann/GT_bigann-10M
+
+python3 - <<'PY'
+import struct
+
+with open("data/bigann/GT_bigann-10M", "rb") as stream:
+    queries, gt_k = struct.unpack("<II", stream.read(8))
+print(f"GT queries={queries}, GT k={gt_k}")
+PY
+```
+
+下面的命令读取 `learn.100M.u8bin` 的前 10M 条，将 `global_id % 2` 相同的向量放入同一个 shard，使用 hnswlib 分别构建两个索引并保存。文件名中的 `10M` 会自动触发 `--gt-base-size 10000000`；显式写出该参数可以避免自定义 GT 文件名导致误加载 100M：
+
 首次构建 BIGANN 10M HNSW：
 
 ```bash
@@ -157,6 +182,7 @@ SPANN: shard_0.spann, shard_1.spann, ...
     --base data/bigann/learn.100M.u8bin \
     --query data/bigann/query.public.10K.u8bin \
     --groundtruth data/bigann/GT_bigann-10M \
+    --gt-base-size 10000000 --max-queries 1000 \
     --data-type u8 --metric l2 \
     --shards 2 --threads-per-shard 8 --k 10 \
     --M 16 --ef-construction 100 --ef-search 80 \
@@ -164,9 +190,21 @@ SPANN: shard_0.spann, shard_1.spann, ...
     --index-mode build
 ```
 
-后续加载：
+该命令会先建索引和保存，再使用前 1000 条 query 执行一次测试；当前没有单独的 `build-only` 模式。构建成功后应生成：
+
+```text
+data/indexes/bigann_10m_hnsw_s2/shard_0.hnsw
+data/indexes/bigann_10m_hnsw_s2/shard_1.hnsw
+```
+
+旧版自研 HNSW 索引不能加载。如果目录中存在旧索引，应换一个新的 `--index-dir`，或者在确认不再需要后手动移走旧文件。
+
+### 加载索引并测试搜索性能
+
+性能测试必须使用 `--index-mode load`，否则结果会混入读取 10M base 和建图过程。下面执行全部 10K query，同时把程序 CSV 和进程级资源统计分别保存：
 
 ```bash
+/usr/bin/time -v -o bigann_hnsw_s2.time \
 ./build/hnsw_threshold \
     --engine hnsw --runtime multiprocess \
     --query data/bigann/query.public.10K.u8bin \
@@ -175,8 +213,37 @@ SPANN: shard_0.spann, shard_1.spann, ...
     --shards 2 --threads-per-shard 8 --k 10 \
     --M 16 --ef-construction 100 --ef-search 80 \
     --index-dir data/indexes/bigann_10m_hnsw_s2 \
+    --index-mode load \
+    > bigann_hnsw_s2.csv
+```
+
+建议先运行一次作为 page-cache warm-up，再重复运行至少三次。快速冒烟时加入 `--max-queries 1000`。加载时必须保持建索引时相同的 `--shards`、`--metric` 和数据维度；`ef-search`、`k`、`threads-per-shard` 与 `threshold-scale` 可以在查询时调整。
+
+程序默认 `--mode all`，会顺序执行 independent 和 shared 两轮。重点比较 CSV 中：
+
+- `avg_latency_ns`：每条 query 最慢 shard worker 的搜索 wall-clock，不含索引加载和父进程最终 merge；
+- `avg_distance_computations`、`avg_expansions`：共享 threshold 减少的实际搜索工作量；
+- `recall`：任何计算收益都必须在可接受的 Recall 差值下判断；
+- `bigann_hnsw_s2.time`：包含索引加载、两轮查询和进程管理的端到端时间及峰值 RSS。
+
+例如，要求 shared Recall 相对 independent 最多下降 0.005。不要把 Recall 明显下降得到的剪枝量视为有效收益。
+
+扫描 threshold scale 时复用已经保存的索引：
+
+```bash
+LATENCIES=0 bash scripts/run_sweep.sh \
+    ./build/hnsw_threshold bigann_hnsw_s2_sweep.csv \
+    --engine hnsw --runtime multiprocess \
+    --query data/bigann/query.public.10K.u8bin \
+    --groundtruth data/bigann/GT_bigann-10M \
+    --gt-base-size 10000000 --data-type u8 --metric l2 \
+    --shards 2 --threads-per-shard 8 --k 10 \
+    --M 16 --ef-construction 100 --ef-search 80 \
+    --index-dir data/indexes/bigann_10m_hnsw_s2 \
     --index-mode load
 ```
+
+`multiprocess` 使用真实共享内存，本模式中的 `--latency-ns` 不会注入网络延迟；扫描脚本中的 latency 维度只对 `simulated` 有意义。因此上面的真实多进程命令用 `LATENCIES=0` 只扫描 `threshold-scale`。
 
 SPANN-like 只需将 `--engine hnsw` 及 HNSW 参数替换为：
 
@@ -184,7 +251,7 @@ SPANN-like 只需将 `--engine hnsw` 及 HNSW 参数替换为：
 --engine spann --postings-per-shard 32 --nprobe 16 --kmeans-iterations 3
 ```
 
-加载时会校验 magic/version、维度、距离类型、posting 数、图边或 posting member 范围，以及索引总向量数与 GT base 规模是否一致。
+SPANN-like 加载时会校验 magic/version、维度、距离类型、posting 数和 posting member 范围。HNSW 使用 hnswlib 原生加载校验。两种模式都会校验索引总向量数与 GT base 规模是否一致。
 
 当前索引以 float 保存向量，体积大于原始 uint8 数据；后续可增加紧凑 uint8 持久化和 mmap 加载。
 
@@ -233,6 +300,7 @@ bash scripts/run_shard_sweep.sh \
 
 - multiprocess 的最终 top-k 在所有 shard 进程结束后由父进程合并，聚合时间未计入 `avg_latency_ns`。
 - HNSW threshold early-stop 是近似策略，没有 Recall 保证。
+- HNSW 搜索循环由实验适配层逐步驱动，图结构和距离内核来自 hnswlib，但不是直接调用一次完整的 `searchKnn()`；这是实时读取跨进程 threshold 所必需的插桩点。
 - SPANN-like 的严格球形下界在真实 BIGANN posting 上可能过松，导致没有剪枝收益。
 - 多进程索引由父进程构建或加载后通过 `fork` 只读共享；尚未做 NUMA first-touch 和跨 socket 数据放置优化。
 - 当前持久化向量为 float，尚未支持紧凑 uint8 mmap 和真实 SSD posting 文件。

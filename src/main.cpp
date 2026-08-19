@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include <hnswlib/hnswlib.h>
+
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -197,253 +199,81 @@ struct MaxCmp {
     bool operator()(const Item &a, const Item &b) const { return a.d < b.d; }
 };
 
+// Thin adapter over upstream hnswlib. Construction, graph layout, SIMD distance
+// kernels and serialization are provided by hnswlib; SearchState below only
+// drives the graph one expansion at a time so it can observe remote thresholds.
 class HNSW {
     public:
-    HNSW(int dim, int M, int efc, uint64_t seed, bool ip = false) : dim_(dim), M_(M), efc_(efc), ip_(ip), rng_(seed) {}
-
-    void add(Vec v, int global_id) {
-        int id = static_cast<int>(data_.size());
-        int level = random_level();
-        data_.push_back(std::move(v));
-        global_.push_back(global_id);
-        levels_.push_back(level);
-        links_.emplace_back(level + 1);
-        if (entry_ < 0) {
-            entry_ = id;
-            max_level_ = level;
-            return;
-        }
-        int ep = entry_;
-        for (int l = max_level_; l > level; --l)
-            ep = greedy(data_[id], ep, l);
-        for (int l = std::min(level, max_level_); l >= 0; --l) {
-            auto candidates = search_layer(data_[id], ep, efc_, l);
-            if (!candidates.empty())
-                ep = candidates.front().id;
-            auto selected = select_neighbors(candidates, l == 0 ? 2 * M_ : M_);
-            for (int nb : selected) {
-                links_[id][l].push_back(nb);
-                links_[nb][l].push_back(id);
-                prune(nb, l);
-            }
-        }
-        if (level > max_level_) {
-            entry_ = id;
-            max_level_ = level;
-        }
+    HNSW(int dim, int M, int efc, uint64_t seed, bool ip, size_t capacity)
+        : dim_(dim), ip_(ip), capacity_(std::max<size_t>(capacity, 1)) {
+        reset_space();
+        index_ = std::make_unique<hnswlib::HierarchicalNSW<float>>(space_.get(), capacity_, M, efc, seed);
     }
 
-    int size() const { return static_cast<int>(data_.size()); }
-    int entry() const { return entry_; }
-    int max_level() const { return max_level_; }
-    int global_id(int id) const { return global_[id]; }
-    const Vec &vec(int id) const { return data_[id]; }
-    const std::vector<int> &neighbors(int id, int level) const { return links_[id][level]; }
-    float query_distance(const Vec &q, int id) const { return dist(q, data_[id]); }
+    void add(Vec v, int global_id) { index_->addPoint(v.data(), static_cast<hnswlib::labeltype>(global_id)); }
+    int size() const { return static_cast<int>(index_->getCurrentElementCount()); }
+    int global_id(int id) const { return static_cast<int>(index_->getExternalLabel(id)); }
+    hnswlib::VisitedList *acquire_visited() const { return index_->visited_list_pool_->getFreeVisitedList(); }
+    void release_visited(hnswlib::VisitedList *visited) const {
+        index_->visited_list_pool_->releaseVisitedList(visited);
+    }
+
+    float query_distance(const Vec &q, int id) const {
+        return index_->fstdistfunc_(q.data(), index_->getDataByInternalId(id), index_->dist_func_param_);
+    }
+
+    std::pair<const hnswlib::tableint *, size_t> neighbors(int id, int level) const {
+        auto *links = index_->get_linklist_at_level(id, level);
+        return {reinterpret_cast<const hnswlib::tableint *>(links + 1), index_->getListCount(links)};
+    }
 
     int upper_entry(const Vec &q, uint64_t &distance_count) const {
-        if (entry_ < 0)
+        if (index_->getCurrentElementCount() == 0)
             return -1;
-        int cur = entry_;
-        float cd = dist(q, data_[cur]);
+        hnswlib::tableint current = index_->enterpoint_node_;
+        float current_distance = query_distance(q, current);
         ++distance_count;
-        for (int level = max_level_; level > 0; --level) {
+        for (int level = index_->maxlevel_; level > 0; --level) {
             bool changed = true;
             while (changed) {
                 changed = false;
-                for (int nb : links_[cur][level]) {
-                    float d = dist(q, data_[nb]);
+                auto [adjacent, count] = neighbors(current, level);
+                for (size_t i = 0; i < count; ++i) {
+                    float candidate_distance = query_distance(q, adjacent[i]);
                     ++distance_count;
-                    if (d < cd) {
-                        cd = d;
-                        cur = nb;
+                    if (candidate_distance < current_distance) {
+                        current_distance = candidate_distance;
+                        current = adjacent[i];
                         changed = true;
                     }
                 }
             }
         }
-        return cur;
+        return static_cast<int>(current);
     }
 
-    void save(const std::string &path) const {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out)
-            throw std::runtime_error("cannot create index " + path);
-        const char magic[8] = {'H', 'N', 'S', 'W', 'I', 'D', 'X', '1'};
-        uint32_t dim = dim_, m = M_, efc = efc_, ip = ip_;
-        int32_t entry = entry_, max_level = max_level_;
-        uint64_t count = data_.size();
-        out.write(magic, sizeof(magic));
-        out.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
-        out.write(reinterpret_cast<const char *>(&m), sizeof(m));
-        out.write(reinterpret_cast<const char *>(&efc), sizeof(efc));
-        out.write(reinterpret_cast<const char *>(&ip), sizeof(ip));
-        out.write(reinterpret_cast<const char *>(&entry), sizeof(entry));
-        out.write(reinterpret_cast<const char *>(&max_level), sizeof(max_level));
-        out.write(reinterpret_cast<const char *>(&count), sizeof(count));
-        for (size_t i = 0; i < data_.size(); ++i) {
-            int32_t global_id = global_[i], level = levels_[i];
-            out.write(reinterpret_cast<const char *>(&global_id), sizeof(global_id));
-            out.write(reinterpret_cast<const char *>(&level), sizeof(level));
-            out.write(reinterpret_cast<const char *>(data_[i].data()), dim_ * sizeof(float));
-            for (int l = 0; l <= level; ++l) {
-                uint32_t degree = links_[i][l].size();
-                out.write(reinterpret_cast<const char *>(&degree), sizeof(degree));
-                out.write(reinterpret_cast<const char *>(links_[i][l].data()), degree * sizeof(int));
-            }
-        }
-        if (!out)
-            throw std::runtime_error("failed while writing index " + path);
-    }
+    void save(const std::string &path) const { index_->saveIndex(path); }
 
     void load(const std::string &path, int expected_dim, bool expected_ip) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-            throw std::runtime_error("cannot open index " + path);
-        char magic[8];
-        uint32_t dim = 0, m = 0, efc = 0, ip = 0;
-        int32_t entry = -1, max_level = -1;
-        uint64_t count = 0;
-        in.read(magic, sizeof(magic));
-        in.read(reinterpret_cast<char *>(&dim), sizeof(dim));
-        in.read(reinterpret_cast<char *>(&m), sizeof(m));
-        in.read(reinterpret_cast<char *>(&efc), sizeof(efc));
-        in.read(reinterpret_cast<char *>(&ip), sizeof(ip));
-        in.read(reinterpret_cast<char *>(&entry), sizeof(entry));
-        in.read(reinterpret_cast<char *>(&max_level), sizeof(max_level));
-        in.read(reinterpret_cast<char *>(&count), sizeof(count));
-        const char expected_magic[8] = {'H', 'N', 'S', 'W', 'I', 'D', 'X', '1'};
-        if (!in || !std::equal(std::begin(magic), std::end(magic), std::begin(expected_magic)) ||
-            dim != static_cast<uint32_t>(expected_dim) || ip != static_cast<uint32_t>(expected_ip))
-            throw std::runtime_error("invalid or incompatible index " + path);
-        dim_ = dim;
-        M_ = m;
-        efc_ = efc;
-        ip_ = ip;
-        entry_ = entry;
-        max_level_ = max_level;
-        data_.assign(count, Vec(dim_));
-        global_.resize(count);
-        levels_.resize(count);
-        links_.resize(count);
-        for (size_t i = 0; i < count; ++i) {
-            int32_t global_id = 0, level = 0;
-            in.read(reinterpret_cast<char *>(&global_id), sizeof(global_id));
-            in.read(reinterpret_cast<char *>(&level), sizeof(level));
-            if (level < 0 || level > 64)
-                throw std::runtime_error("invalid HNSW level in " + path);
-            global_[i] = global_id;
-            levels_[i] = level;
-            in.read(reinterpret_cast<char *>(data_[i].data()), dim_ * sizeof(float));
-            links_[i].resize(level + 1);
-            for (int l = 0; l <= level; ++l) {
-                uint32_t degree = 0;
-                in.read(reinterpret_cast<char *>(&degree), sizeof(degree));
-                links_[i][l].resize(degree);
-                in.read(reinterpret_cast<char *>(links_[i][l].data()), degree * sizeof(int));
-                for (int neighbor : links_[i][l])
-                    if (neighbor < 0 || static_cast<uint64_t>(neighbor) >= count)
-                        throw std::runtime_error("invalid HNSW edge in " + path);
-            }
-        }
-        if (!in || entry_ < 0 || static_cast<uint64_t>(entry_) >= count)
-            throw std::runtime_error("truncated index " + path);
+        dim_ = expected_dim;
+        ip_ = expected_ip;
+        reset_space();
+        index_ = std::make_unique<hnswlib::HierarchicalNSW<float>>(space_.get(), path);
+        capacity_ = index_->getMaxElements();
     }
 
     private:
-    int dim_, M_, efc_, entry_ = -1, max_level_ = -1;
+    int dim_;
     bool ip_;
-    std::mt19937_64 rng_;
-    std::vector<Vec> data_;
-    std::vector<int> global_, levels_;
-    std::vector<std::vector<std::vector<int>>> links_;
+    size_t capacity_;
+    std::unique_ptr<hnswlib::SpaceInterface<float>> space_;
+    std::unique_ptr<hnswlib::HierarchicalNSW<float>> index_;
 
-    float dist(const Vec &a, const Vec &b) const { return distance_of(a, b, ip_); }
-
-    int random_level() {
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        return static_cast<int>(-std::log(std::max(u(rng_), 1e-12)) / std::log(static_cast<double>(M_)));
-    }
-    int greedy(const Vec &q, int ep, int level) const {
-        float best = dist(q, data_[ep]);
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (int nb : links_[ep][level]) {
-                float d = dist(q, data_[nb]);
-                if (d < best) {
-                    best = d;
-                    ep = nb;
-                    changed = true;
-                }
-            }
-        }
-        return ep;
-    }
-    std::vector<Item> search_layer(const Vec &q, int ep, int ef, int level) const {
-        std::priority_queue<Item, std::vector<Item>, MinCmp> candidates;
-        std::priority_queue<Item, std::vector<Item>, MaxCmp> best;
-        std::unordered_set<int> seen;
-        float d = dist(q, data_[ep]);
-        candidates.push({d, ep});
-        best.push({d, ep});
-        seen.insert(ep);
-        while (!candidates.empty()) {
-            Item c = candidates.top();
-            candidates.pop();
-            if (best.size() >= static_cast<size_t>(ef) && c.d > best.top().d)
-                break;
-            for (int nb : links_[c.id][level])
-                if (seen.insert(nb).second) {
-                    float nd = dist(q, data_[nb]);
-                    if (best.size() < static_cast<size_t>(ef) || nd < best.top().d) {
-                        candidates.push({nd, nb});
-                        best.push({nd, nb});
-                        if (best.size() > static_cast<size_t>(ef))
-                            best.pop();
-                    }
-                }
-        }
-        std::vector<Item> out;
-        while (!best.empty()) {
-            out.push_back(best.top());
-            best.pop();
-        }
-        std::sort(out.begin(), out.end(), [](auto &a, auto &b) { return a.d < b.d; });
-        return out;
-    }
-    void prune(int id, int level) {
-        auto &n = links_[id][level];
-        int cap = level == 0 ? 2 * M_ : M_;
-        if (n.size() <= static_cast<size_t>(cap))
-            return;
-        std::vector<Item> candidates;
-        candidates.reserve(n.size());
-        for (int x : n)
-            candidates.push_back({dist(data_[id], data_[x]), x});
-        n = select_neighbors(candidates, cap);
-    }
-    std::vector<int> select_neighbors(std::vector<Item> candidates, int cap) const {
-        std::sort(candidates.begin(), candidates.end(), [](auto &a, auto &b) { return a.d < b.d; });
-        std::vector<int> selected, rejected;
-        selected.reserve(cap);
-        for (const auto &c : candidates) {
-            bool diverse = true;
-            for (int s : selected)
-                if (dist(data_[c.id], data_[s]) < c.d) {
-                    diverse = false;
-                    break;
-                }
-            (diverse ? selected : rejected).push_back(c.id);
-            if (selected.size() == static_cast<size_t>(cap))
-                break;
-        }
-        for (int x : rejected) {
-            if (selected.size() == static_cast<size_t>(cap))
-                break;
-            selected.push_back(x);
-        }
-        return selected;
+    void reset_space() {
+        if (ip_)
+            space_ = std::make_unique<hnswlib::InnerProductSpace>(dim_);
+        else
+            space_ = std::make_unique<hnswlib::L2Space>(dim_);
     }
 };
 
@@ -639,7 +469,7 @@ struct SearchState {
     bool done = false, threshold_stopped = false;
     std::priority_queue<Item, std::vector<Item>, MinCmp> candidates;
     std::priority_queue<Item, std::vector<Item>, MaxCmp> best;
-    std::unordered_set<int> seen;
+    hnswlib::VisitedList *visited = nullptr;
 
     void init(uint64_t distance_ns) {
         int ep = index->upper_entry(*q, distances);
@@ -653,7 +483,8 @@ struct SearchState {
         clock += distance_ns;
         candidates.push({d, ep});
         best.push({d, ep});
-        seen.insert(ep);
+        visited = index->acquire_visited();
+        visited->mass[ep] = visited->curV;
     }
     void step(bool shared, double threshold_scale, uint64_t distance_ns, uint64_t expansion_ns) {
         if (done)
@@ -678,8 +509,11 @@ struct SearchState {
             return;
         }
         uint64_t before = distances;
-        for (int nb : index->neighbors(c.id, 0))
-            if (seen.insert(nb).second) {
+        auto [neighbors, neighbor_count] = index->neighbors(c.id, 0);
+        for (size_t neighbor_index = 0; neighbor_index < neighbor_count; ++neighbor_index) {
+            int nb = neighbors[neighbor_index];
+            if (visited->mass[nb] != visited->curV) {
+                visited->mass[nb] = visited->curV;
                 float d = index->query_distance(*q, nb);
                 ++distances;
                 if (best.size() < static_cast<size_t>(ef) || d < best.top().d) {
@@ -689,8 +523,15 @@ struct SearchState {
                         best.pop();
                 }
             }
+        }
         ++expansions;
         clock += expansion_ns + (distances - before) * distance_ns;
+    }
+    void release_visited() {
+        if (visited != nullptr) {
+            index->release_visited(visited);
+            visited = nullptr;
+        }
     }
     std::vector<Item> top(int limit) const {
         auto copy = best;
@@ -804,6 +645,7 @@ static Result run_query(const std::vector<HNSW> &indexes, const Vec &q, const Ar
         r.threshold_stops += x.threshold_stopped;
         r.latency = std::max(r.latency, x.clock);
         lists.push_back(x.top(a.k));
+        x.release_visited();
     }
     r.top = merge_top(lists, a.k);
     return r;
@@ -1305,6 +1147,7 @@ static Aggregate run_hnsw_multiprocess(const std::vector<HNSW> &indexes, const s
                         }
                         auto elapsed = std::chrono::steady_clock::now() - begin;
                         auto local = state.top(a.k);
+                        state.release_visited();
                         auto &metric = metrics[cell];
                         metric.distances = state.distances;
                         metric.expansions = state.expansions;
@@ -1416,8 +1259,9 @@ int main(int argc, char **argv) try {
     std::vector<SpannIndex> spann_indexes;
     if (a.engine == "hnsw") {
         hnsw_indexes.reserve(a.shards);
+        size_t shard_capacity = load_persisted ? 1 : (static_cast<size_t>(a.n) + a.shards - 1) / a.shards;
         for (int i = 0; i < a.shards; ++i)
-            hnsw_indexes.emplace_back(a.dim, a.M, a.ef_construction, a.seed + 100 + i, ip);
+            hnsw_indexes.emplace_back(a.dim, a.M, a.ef_construction, a.seed + 100 + i, ip, shard_capacity);
         if (load_persisted) {
             size_t total_vectors = 0;
             for (int shard = 0; shard < a.shards; ++shard) {
